@@ -25,9 +25,11 @@ it can be run quickly on a single machine.
 
 # Step 2.
 # This step does the counting.
-./run count
-```
+./run count count
 
+# Step 3.
+./plot.py
+```
 
 # Reference
 
