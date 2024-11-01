@@ -18,7 +18,7 @@
 #include <xtensor/xtensor.hpp>
 #include <xtensor/xfixed.hpp>
 #include <xtensor/xview.hpp>
-#include <xtensor/xio.hpp>
+#include <xtensor/xnpy.hpp>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -39,9 +39,16 @@ typedef int64_t openalex_id_t;
 openalex_id_t constexpr INVALID_ID = -1;
 int constexpr COUNTRY_US = 0x01;
 int constexpr COUNTRY_CN = 0x02;
+int constexpr COUNTRY_OTHER = 0x04;
 int constexpr YEAR_BEGIN = 1990;
 int constexpr YEAR_END = 2030;
 int constexpr TOTAL_YEARS = YEAR_END - YEAR_BEGIN;
+
+string const EnCS_DOMAIN_NAME = "Engineering and Computer Science";
+int constexpr EnCS_DOMAIN_ID = -2; // openalex does not have this domain
+                                    // but it is used in the study
+int constexpr FIELD_ENGINEERING = 22;
+int constexpr FIELD_CS = 17;
 
 namespace errors {
     atomic<int> bad_json(0);
@@ -107,7 +114,47 @@ public:
         (*j)["cn_years"] = cn;
     }
 
-    int move_year () {
+    bool has_gap () const {
+        // where there's a gap of more than 5 years
+        vector<int> years;
+        for (int i = 0; i < TOTAL_YEARS; ++i) {
+            if (at(i) > 0) years.push_back(i);
+        }
+        for (int i = 1; i < years.size(); ++i) {
+            if (years[i] - years[i - 1] > 5) return true;
+        }
+        return false;
+    }
+
+    int migrate_year_offset () const {
+        if (has_gap()) return -1;
+        // This criteria results in more results than previous study
+        int off = 0;
+        while (off < TOTAL_YEARS && !(at(off) & COUNTRY_US)) ++off;
+        if (off >= TOTAL_YEARS) return -1;
+        int first_us = off;
+        off = 0;
+        while (off < TOTAL_YEARS && !(at(off) & COUNTRY_CN)) ++off;
+        if (off >= TOTAL_YEARS) return -1;
+        int first_cn = off;
+        if (!(first_us < first_cn)) return -1;
+
+        off = TOTAL_YEARS - 1;
+        // find the first appearance of CN backward
+        while (off >= 0 && !(at(off) & COUNTRY_CN)) --off;
+        if (off < 0) return -1;
+        int last_cn = off;
+        while (off >= 0 && !(at(off) & COUNTRY_US)) --off;
+        if (off < 0) return -1;
+        int last_us = off;
+        if (!(last_us < last_cn)) return -1;
+        // we are sure now that last_us < last_cn
+        if (at(last_us) & COUNTRY_CN) return last_us;
+        return last_us + 1;
+    }
+
+#if 0
+    int migrate_year_offset_strict () const {
         // detect the year when the author moves from US to CN
         // if not detected return -1
         // Criteria
@@ -117,8 +164,32 @@ public:
         // 3. for all n < N, author is in US only
         // 4. author must be in US in N or N-1
         // we don't count people who move back and forth
-        return 0;
+        int off = 0;
+        while (off < TOTAL_YEARS && !(at(off) & COUNTRY_US)) ++off;
+        if (off >= TOTAL_YEARS) return -1;
+        int first_us = off;
+        off = 0;
+        while (off < TOTAL_YEARS && !(at(off) & COUNTRY_CN)) ++off;
+        if (off >= TOTAL_YEARS) return -1;
+        int first_cn = off;
+        if (!(first_us < first_cn)) return -1;
+
+        off = TOTAL_YEARS - 1;
+        // find the first appearance of CN backward
+        while (off >= 0 && !(at(off) & COUNTRY_CN)) --off;
+        if (off < 0) return -1;
+        int last_cn = off;
+        while (off >= 0 && !(at(off) & COUNTRY_US)) --off;
+        if (off < 0) return -1;
+        int last_us = off;
+        if (!(last_us < last_cn)) return -1;
+
+        if (first_cn < last_us) return -1;
+        // we are sure now that last_us < last_cn
+        if (at(last_us) & COUNTRY_CN) return last_us;
+        return last_us + 1;
     }
+#endif
 };
 
 openalex_id_t extract_id (string const &url, string const &prefix) {
@@ -135,25 +206,28 @@ openalex_id_t extract_id (string const &url, string const &prefix) {
     return id;
 }
 
+int constexpr DOMAIN_LEVEL_DOMAIN = 0;
+int constexpr DOMAIN_LEVEL_FIELD = 1;
+int constexpr NUM_LEVELS = 10;
+
 struct Domain {
+    // this covers fields and domains
+    // id = openalex_id * NUM_LEVELS + level
     static string const URL_PREFIX;
     openalex_id_t id;
     string display_name;
     string url () const {
-        return format("{}/{}", URL_PREFIX, id);
+        return format("{}{}", URL_PREFIX, id);
     }
     Domain (): id(-1) {}
-    Domain (json const &j): id(extract_id(j["id"], URL_PREFIX)) {
+    Domain (json const &j) {
+        id = extract_id(j["id"], URL_PREFIX);
         display_name = j["display_name"];
     }
 };
 
-string const Domain::URL_PREFIX("https://openalex.org/domains/");
-
-struct DomainInfo: public Domain {
-    xt::xtensor_fixed<int, xt::xshape<TOTAL_YEARS>> counts;
-    DomainInfo (): Domain() { counts.fill(0); }
-};
+string const Domain::URL_PREFIX = "https://openalex.org/domains/";
+string const FIELD_URL_PREFIX = "https://openalex.org/fields/";
 
 struct Author {
     static string const URL_PREFIX;
@@ -166,18 +240,30 @@ struct Author {
         display_name = j["display_name"];
         domains[INVALID_ID] = "All";
         if (j.contains("topics")) {
+            bool has_en_cs = false;
             for (auto const &topic : j["topics"]) {
                 Domain domain(topic["domain"]);
                 domains[domain.id] = domain.display_name;
+
+                int field_id = extract_id(topic["field"]["id"], FIELD_URL_PREFIX);
+                if (field_id < 0) {
+                    cerr << "Invalid field ID: " << topic["field"]["id"] << endl;
+                    throw 0;
+                }
+                if (field_id == FIELD_ENGINEERING || field_id == FIELD_CS) {
+                    has_en_cs = true;
+                }
+            }
+            if (has_en_cs) {
+                domains[EnCS_DOMAIN_ID] = EnCS_DOMAIN_NAME;
             }
         }
         if (j.contains("affiliations")) {
             for (auto const &affiliation : j["affiliations"]) {
                 string country = affiliation["institution"]["country_code"];
-                int country_code = 0;
+                int country_code = COUNTRY_OTHER;
                 if (country == "US") country_code = COUNTRY_US;
                 else if (country == "CN") country_code = COUNTRY_CN;
-                else continue;
                 for (int year: affiliation["years"]) {
                     years.add(year, country_code);
                 }
@@ -195,7 +281,8 @@ struct Author {
         (*j)["display_name"] = display_name;
         json jdomains = json::array();
         for (auto const &[id, name] : domains) {
-            jdomains.push_back({{"id", id}, {"display_name", name}});
+            jdomains.push_back({{"id", id},
+                                {"display_name", name}});
         }
         (*j)["domains"] = jdomains;
         json jyears;
@@ -205,11 +292,6 @@ struct Author {
 };
 
 string const Author::URL_PREFIX("https://openalex.org/A");
-
-class Survey {
-    unordered_map<int, Domain> domains;
-public:
-};
 
 // Function to process a file and extract matching authors
 void test (string const &path) {
@@ -277,24 +359,89 @@ void filter_chinese (string const &datadir) {
     cerr << format("Errors: {} bad JSON, {} invalid IDs", errors::bad_json.load(), errors::invalid_id.load()) << endl;
 }
 
-void count_migration (string const &datadir) {
+struct DomainCount: public Domain {
+    xt::xtensor_fixed<int, xt::xshape<TOTAL_YEARS>> counts;
+    DomainCount (): Domain() { counts.fill(0); }
+
+    void add (int id, string const &name, int year_offset, int delta = 1) {
+        if (this->display_name.empty()) {
+            this->id = id;
+            this->display_name = name;
+        }
+        counts[year_offset] += delta;
+    }
+
+    void merge (DomainCount const &other) {
+        add(other.id, other.display_name, 0, 0);
+        counts += other.counts;
+    }
+};
+
+struct Survey {
+    unordered_map<openalex_id_t, DomainCount> domains;
+public:
+    void add (Author const &author) {
+        int year_offset = author.years.migrate_year_offset();
+        if (year_offset < 0) return;
+        for (auto const &[id, name] : author.domains) {
+            domains[id].add(id, name, year_offset);
+        }
+    }
+    void merge (Survey const &other) {
+        for (auto const &[id, count] : other.domains) {
+            domains[id].merge(count);
+        }
+    }
+    void save (string const &path) const {
+       json meta;
+       meta["year_begin"] = YEAR_BEGIN;
+       meta["year_end"] = YEAR_END;
+       json jdomains = json::array();
+       xt::xtensor<int, 2> counts;
+       counts.resize({domains.size(), TOTAL_YEARS});
+       int i = 0;
+       for (auto const &[id, domain]: domains) {
+           jdomains.push_back({{"id", domain.id},
+                               {"display_name", domain.display_name}});
+           xt::view(counts, i, xt::all()) = domain.counts;
+           ++i;
+       }
+       meta["domains"] = jdomains;
+       fs::create_directories(path);
+       ofstream os(path + "/meta.json");
+       os << meta.dump(2) << endl;
+       xt::dump_npy(path + "/counts.npy", counts);
+    }
+};
+
+void count_migration (string const &datadir, string const &outdir) {
     vector<string> files;
     scan_files(datadir, &files);
     cout << "Found " << files.size() << " files" << endl;
     int done = 0;
+    Survey survey;
     #pragma omp parallel for
     for (size_t i = 0; i < files.size(); ++i) {
         bxz::ifstream iss(files[i]);
         string line;
+        Survey local;
         while (getline(iss, line)) {
             try {
                 Author author(json::parse(line));
+                local.add(author);
             } catch (const json::exception& e) {
                 errors::bad_json += 1;
             }
         }
+        #pragma omp critical
+        {
+            survey.merge(local);
+            ++done;
+            cout << format("Processed {}/{}", done, files.size()) << endl;
+        }
     }
     cerr << format("Errors: {} bad JSON, {} invalid IDs", errors::bad_json.load(), errors::invalid_id.load()) << endl;
+    survey.save(outdir);
 }
 
 
@@ -314,7 +461,12 @@ int main(int argc, char **argv) {
         filter_chinese("data/authors");
     }
     else if (strcmp(argv[1], "count") == 0) {
-        count_migration("data/filtered");
+        if (argc < 3) {
+            cerr << "Usage: " << argv[0] << " test <out_dir>" << endl;
+        }
+        else {
+            count_migration("data/filtered", argv[2]);
+        }
     }
     return 0;
 }
