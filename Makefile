@@ -2,4 +2,4 @@ CXXFLAGS += -O3 -g -I3rd/json/single_include -I3rd/bxzstr/include -I3rd/xtensor/
 LDFLAGS += -fopenmp
 LDLIBS += -lz
 
-all:	run
+all:	run_all_countries
