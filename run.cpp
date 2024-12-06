@@ -45,8 +45,10 @@ int constexpr YEAR_END = 2030;
 int constexpr TOTAL_YEARS = YEAR_END - YEAR_BEGIN;
 
 string const EnCS_DOMAIN_NAME = "Engineering and Computer Science";
-int constexpr EnCS_DOMAIN_ID = -2; // openalex does not have this domain
-                                    // but it is used in the study
+int constexpr EnCS_DOMAIN_ID = -2;
+// openalex does not have this domain
+// but it is used in the study
+// So we propote the subdomain to this special top-level ID
 int constexpr FIELD_ENGINEERING = 22;
 int constexpr FIELD_CS = 17;
 
@@ -55,6 +57,7 @@ namespace errors {
     atomic<int> invalid_id(0);
 };
 
+// A dictionary to check if a name is Chinese
 class Surnames {
     unordered_set<string> surnames;
     static Surnames singleton;
@@ -82,8 +85,10 @@ public:
     }
 };
 
+
 Surnames Surnames::singleton;
 
+// A mask to record the years when an author is in US or CN
 class YearMask: array<uint8_t, TOTAL_YEARS> {
 public:
     YearMask () { fill(0); }
@@ -444,8 +449,7 @@ void count_migration (string const &datadir, string const &outdir) {
     survey.save(outdir);
 }
 
-
-int main(int argc, char **argv) {
+int main (int argc, char **argv) {
     if (argc <= 1) {
         cerr << "Usage: " << argv[0] <<  " [test | filter | count]" << endl;
     }
