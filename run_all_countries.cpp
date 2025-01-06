@@ -36,7 +36,7 @@ using std::unordered_map;
 using std::unordered_set;
 
 typedef int64_t openalex_id_t;
-openalex_id_t constexpr INVALID_ID = -1;
+openalex_id_t constexpr INVALID_ID = -1;    // also used as the ID of domain "ALL"
 uint32_t constexpr COUNTRY_ID_US = 0;
 uint32_t constexpr COUNTRY_MASK_US = 1 << COUNTRY_ID_US;
 int constexpr YEAR_BEGIN = 1990;
@@ -87,11 +87,14 @@ public:
 Surnames Surnames::singleton;
 
 static char const *COUNTRY_CODES[] = {
+    "US","CN","IN","CA","DE","FR","AU","KR","JP","CH","UK", "other", nullptr
+    /*
     "US", "CN", "DE", "UK", "JP", "FR", "CA", "KR", 
     "CH", "AU", "IN", "IT", "ES", "NL", "SE", "IL", 
     "DK", "SG", "TW", "RU", "other", nullptr
+    */
 };
-static constexpr int NUM_COUNTRIES = 21;
+static constexpr int NUM_COUNTRIES = 12;
 static constexpr int OTHER_COUNTRY_ID = NUM_COUNTRIES - 1;
 
 class CountryLookup {
@@ -128,9 +131,10 @@ public:
 CountryLookup CountryLookup::singleton;
 
 struct Migration {
-    int year_offset;
+    int year_offset;        // offset from YEAR_BEGIN
     uint32_t country_id;    // country_id == 0 means invalid
                             // because there's no migration
+                            // we only study authors started in US
     Migration (): year_offset(-1), country_id(0) {}
     Migration (int year_offset_, uint32_t country_id_)
         : year_offset(year_offset_),
@@ -143,33 +147,22 @@ struct Migration {
 class YearMask: array<uint32_t, TOTAL_YEARS> {
 public:
     YearMask () { fill(0); }
-    void add (int year, uint32_t value) {
+    void add (int year, uint32_t country_id) {
         if (year < YEAR_BEGIN || year >= YEAR_END) {
             //cerr << "Invalid year: " << year << endl;
             return;
         }
-        at(year - YEAR_BEGIN) |= 1 << value;
-    }
-
-    int count (uint8_t value) const {
-        int cnt = 0;
-        for (int i = 0; i < TOTAL_YEARS; ++i) {
-            if (at(i) & value) ++cnt;
-        }
-        return cnt;
-        // Each year entry is a bitmask of country IDs
+        at(year - YEAR_BEGIN) |= 1 << country_id;
     }
 
 /*
-    void encode (json *j) const {
-        std::vector<int> us;
-        std::vector<int> cn;
-        for (int i = 0; i < TOTAL_YEARS; ++i) {
-            if (at(i) & COUNTRY_US) us.push_back(i + YEAR_BEGIN);
-            if (at(i) & COUNTRY_CN) cn.push_back(i + YEAR_BEGIN);
+    int count (uint8_t value) const {
+        int cnt = 0;
+        for (uint32_t mask: *this) {
+            if (mask & value) ++cnt;
         }
-        (*j)["us_years"] = us;
-        (*j)["cn_years"] = cn;
+        return cnt;
+        // Each year entry is a bitmask of country IDs
     }
     */
 
@@ -191,31 +184,38 @@ public:
     }
 
     Migration get_migration () const {
+        // get migration info of this author based on the year masks
         Migration invalid;
+        // Rule 1.  If there's a gap of more than 5 years, the author is not relevant.
         if (has_gap()) return invalid;
+        // Rule 2.  If no country history, the author is not relevant.
         int off = TOTAL_YEARS - 1;
         while (off >= 0 && (at(off) == 0)) --off;
         if (off < 0) return invalid;
         // found the last year with non-zero mask
         int last_year = off;
+        // Rule 3.  If the last year is in US, the author is not relevant.
         if (at(last_year) & COUNTRY_MASK_US) return invalid;
         // now we are sure the last year author is not in US
         // find the last year author was in US
         while (off >= 0 && ((at(off) & COUNTRY_MASK_US) == 0)) --off;
+        // Rule 4.  If we cannot find a year author was in US, the author is not relevant.
         if (off < 0) return invalid;
         if ((at(off) & COUNTRY_MASK_US) == 0) throw 0;
         int last_us_year = off;
-        // now we know
+        // At this point, we are sure that:
         // - last_year was not in US
-        // - last_us_year was in US (but could also be in another country)
-
+        // - last_us_year ( < last_year)was in US (but could also be in another country)
+    
         // find the first non-US year before
         while (off >= 0 && ((at(off) & COUNTRY_MASK_US) || (at(off) == 0))) --off;
+        //                  in US                        or UNKNOWN
         if (off < 0) {
             ; // OK, the author was only in US previously
         }
         else {
             int first_non_us_year_before = off;
+        // Rule 5.  If the author stayed in US for less than 5 years before migration, the author is not relevant.
             if (last_us_year - first_non_us_year_before < 5) {
                 //  N U U U U U
                 return invalid; // less than 5 years in US
@@ -232,51 +232,15 @@ public:
         if ((mask == 0) || (mask & COUNTRY_MASK_US)) throw 0;
         // at off, the author is only in a non-US country
         // find the destination country
-        int country_id = __builtin_ctz(mask);
+        int country_id = __builtin_ctz(mask);   // here we assume the author is only in one country, if the author is in multiple countries, the most populus will be used
         int migration_year_off = off;
+        // Rule 6. If there's an overlap year, the overlap year is the migration year,
+        // otherwise, the migration year is the first year the author is in a non-US country
         if (at(last_us_year) & (1 << country_id)) {
             migration_year_off = last_us_year;
         }
         return Migration(migration_year_off, country_id);
     }
-
-#if 0
-    int migrate_year_offset_strict () const {
-        // detect the year when the author moves from US to CN
-        // if not detected return -1
-        // Criteria
-        // there exists a year N such that
-        // 1. author is in CN at year N
-        // 2. for all n > N, author is in CN and not in US
-        // 3. for all n < N, author is in US only
-        // 4. author must be in US in N or N-1
-        // we don't count people who move back and forth
-        int off = 0;
-        while (off < TOTAL_YEARS && !(at(off) & COUNTRY_US)) ++off;
-        if (off >= TOTAL_YEARS) return -1;
-        int first_us = off;
-        off = 0;
-        while (off < TOTAL_YEARS && !(at(off) & COUNTRY_CN)) ++off;
-        if (off >= TOTAL_YEARS) return -1;
-        int first_cn = off;
-        if (!(first_us < first_cn)) return -1;
-
-        off = TOTAL_YEARS - 1;
-        // find the first appearance of CN backward
-        while (off >= 0 && !(at(off) & COUNTRY_CN)) --off;
-        if (off < 0) return -1;
-        int last_cn = off;
-        while (off >= 0 && !(at(off) & COUNTRY_US)) --off;
-        if (off < 0) return -1;
-        int last_us = off;
-        if (!(last_us < last_cn)) return -1;
-
-        if (first_cn < last_us) return -1;
-        // we are sure now that last_us < last_cn
-        if (at(last_us) & COUNTRY_CN) return last_us;
-        return last_us + 1;
-    }
-#endif
 };
 
 openalex_id_t extract_id (string const &url, string const &prefix) {
@@ -348,6 +312,7 @@ struct Author {
         if (j.contains("affiliations")) {
             for (auto const &affiliation : j["affiliations"]) {
                 string country = affiliation["institution"]["country_code"];
+    // here's where we want to match the funding data
                 int country_id = CountryLookup::get(country);
                 if (country_id < 0) {
                     cerr << "Invalid country code: " << country << endl;
@@ -443,11 +408,12 @@ void filter_relevant (string const &datadir) {
     cerr << format("Errors: {} bad JSON, {} invalid IDs", errors::bad_json.load(), errors::invalid_id.load()) << endl;
 }
 
+// migration count in each domain
 struct DomainCount: public Domain {
-    // Dim 0: 0 non-chinese, 1 chinese
+    // Dim 0: 0 non-chinese, 1 chinese, 2 all
     // Dim 1: year
     // Dim 2: destination country
-    xt::xtensor_fixed<int, xt::xshape<2, TOTAL_YEARS, NUM_COUNTRIES>> counts;
+    xt::xtensor_fixed<int, xt::xshape<3, TOTAL_YEARS, NUM_COUNTRIES>> counts;
     DomainCount (): Domain() { counts.fill(0); }
 
     void add (int id, string const &name, int is_chinese, int year_offset, int country_id, int delta = 1) {
@@ -455,7 +421,11 @@ struct DomainCount: public Domain {
             this->id = id;
             this->display_name = name;
         }
+        else {
+            if (this->id != id) throw 0;
+        }
         counts(is_chinese, year_offset, country_id) += delta;
+        counts(2, year_offset, country_id) += delta;
     }
 
     void merge (DomainCount const &other) {
@@ -471,7 +441,7 @@ public:
         Migration mig = author.years.get_migration();
         int year_offset = mig.year_offset;
         if (year_offset < 0) return;
-        if (mig.country_id == OTHER_COUNTRY_ID) return;
+        //if (mig.country_id == OTHER_COUNTRY_ID) return;
         int is_chinese = Surnames::is_chinese(author.display_name) ? 1 : 0;
         for (auto const &[id, name] : author.domains) {
             domains[id].add(id, name, is_chinese, year_offset, mig.country_id);
@@ -488,7 +458,7 @@ public:
        meta["year_end"] = YEAR_END;
        json jdomains = json::array();
        xt::xtensor<int, 4> counts;
-       counts.resize({domains.size(), 2, TOTAL_YEARS, NUM_COUNTRIES});
+       counts.resize({domains.size(), 3, TOTAL_YEARS, NUM_COUNTRIES});
        int i = 0;
        for (auto const &[id, domain]: domains) {
            jdomains.push_back({{"id", domain.id},

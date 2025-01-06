@@ -62,6 +62,7 @@ class Surnames {
     unordered_set<string> surnames;
     static Surnames singleton;
     Surnames () {
+        // already in lowercase
         ifstream is("data/surnames.json");
         json j = json::parse(is);
         for (string const &name : j) {
@@ -88,8 +89,9 @@ public:
 
 Surnames Surnames::singleton;
 
-// A mask to record the years when an author is in US or CN
+// A mask to record which countries the author is in during each year
 class YearMask: array<uint8_t, TOTAL_YEARS> {
+    // each entry is a bitmask of countries
 public:
     YearMask () { fill(0); }
     void add (int year, uint8_t value) {
@@ -100,10 +102,10 @@ public:
         at(year - YEAR_BEGIN) |= value;
     }
 
-    int count (uint8_t value) const {
+    int count (uint8_t mask) const {
         int cnt = 0;
-        for (int i = 0; i < TOTAL_YEARS; ++i) {
-            if (at(i) & value) ++cnt;
+        for (uint8_t value: *this) {
+            if (value & mask) ++cnt;
         }
         return cnt;
     }
