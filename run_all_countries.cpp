@@ -3,6 +3,7 @@
 #include <iostream>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 #include <unordered_set>
 #include <unordered_map>
@@ -97,6 +98,9 @@ static char const *COUNTRY_CODES[] = {
 static constexpr int NUM_COUNTRIES = 12;
 static constexpr int OTHER_COUNTRY_ID = NUM_COUNTRIES - 1;
 
+std::mutex missing_country_stats_mutex;
+unordered_map<string, int> missing_country_stats;
+
 class CountryLookup {
     unordered_map<string, int> lookup;
     static CountryLookup singleton;
@@ -122,8 +126,14 @@ public:
     }
 
     static int get (string const &code) {
+        {
+            std::lock_guard<std::mutex> lock(missing_country_stats_mutex);
+            missing_country_stats[code] += 1;
+        }
         auto it = singleton.lookup.find(code);
-        if (it == singleton.lookup.end()) return singleton.lookup.size() - 1;
+        if (it == singleton.lookup.end()) {
+            return singleton.lookup.size() - 1;
+        }
         return it->second;
     }
 };
@@ -525,6 +535,16 @@ int main (int argc, char **argv) {
         }
         else {
             count_migration("data/filtered_all", argv[2]);
+            ofstream os("data/missing_country_stats.txt");
+            vector<std::pair<string, int>> sorted;
+            for (auto const &p: missing_country_stats) {
+                sorted.emplace_back(p);
+            }
+            sort(sorted.begin(), sorted.end(), 
+                 [](auto const &a, auto const &b) { return a.second > b.second; });
+            for (auto const &p: sorted) {
+                os << p.first << "\t" << p.second << endl;
+            }
         }
     }
     return 0;
