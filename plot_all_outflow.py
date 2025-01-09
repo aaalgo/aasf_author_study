@@ -14,7 +14,7 @@ LABELS = [
 
 COUNTRIES = ['US','CN','IN','CA','DE','FR','AU','KR','JP','CH','UK','other'];
 
-ORDER_COUNTRIES = ['CN','IN','CA','DE','FR','AU','KR','JP','CH', 'UK'] #, 'other']
+ORDER_COUNTRIES = ['CN','IN','CA','DE','FR','AU','KR','JP','CH', 'UK']
 
 lookup = {}
 for i, v in enumerate(COUNTRIES):
@@ -37,7 +37,8 @@ class Analyze:
         counts = np.load(os.path.join(root, 'counts.npy'))
         assert counts.shape[-1] == len(COUNTRIES)
         print(meta)
-        #print(counts.shape)
+        print(counts.shape)
+        print(np.sum(counts))
         self.offset = meta['year_begin']
         begin = year_begin - self.offset    
         end = year_end - self.offset
@@ -52,9 +53,8 @@ class Analyze:
         for label in LABELS:
             for i, domain in enumerate(self.meta['domains']):
                 if label == domain['display_name']:
+                    plt.plot(self.X, self.counts[i, 1, :, 1], label=label)
                     break
-            assert label == domain['display_name']
-            plt.plot(self.X, self.counts[i, 1, :, 1], label=label)
         plt.legend()
         plt.savefig(f'{self.root}/chinese_to_china.png')
 
@@ -71,7 +71,8 @@ class Analyze:
         plt.figure()
         plt.title(title)
         if yesno is None:
-            counts = np.sum(self.counts, 1)
+            #counts = np.sum(self.counts, 1)
+            counts = self.counts[:, 2, :, :]
         else:
             counts = self.counts[:, yesno, :, :]
         # Use a colormap with at least 11 distinct colors
@@ -98,13 +99,8 @@ class Analyze:
             plt.pie(Y, labels=X, colors=colors)
             plt.savefig(f'{self.root}/pie_{domain["display_name"].replace(" ", "_")}_{year}.png')
 
-            
-
-
-
-
         
-anal = Analyze('20250106', 2010, 2024)
+anal = Analyze('20250108_outflow', 2010, 2024)
 anal.plot_chinese_to_china()
 anal.plot_chinese_vs_non_chinese()
 anal.plot_all_to_destinations(None, "All Different Destinations")

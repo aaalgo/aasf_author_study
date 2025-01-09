@@ -196,10 +196,14 @@ public:
     Migration get_migration () const {
         // get migration info of this author based on the year masks
         Migration invalid;
-        // Rule 1.  If there's a gap of more than 5 years, the author is not relevant.
         if (has_gap()) return invalid;
+        // Rule 1.  The initial institute must be in US (trained in US)
+        int off = 0;
+        while ((off < size()) && (at(off) == 0)) ++off;
+        if (off >= size()) return invalid;
+        if ((at(off) & COUNTRY_MASK_US) == 0) return invalid;
         // Rule 2.  If no country history, the author is not relevant.
-        int off = TOTAL_YEARS - 1;
+        off = TOTAL_YEARS - 1;
         while (off >= 0 && (at(off) == 0)) --off;
         if (off < 0) return invalid;
         // found the last year with non-zero mask
@@ -225,11 +229,14 @@ public:
         }
         else {
             int first_non_us_year_before = off;
+        /*
         // Rule 5.  If the author stayed in US for less than 5 years before migration, the author is not relevant.
+        // Rule 5 was rejected.
             if (last_us_year - first_non_us_year_before < 5) {
                 //  N U U U U U
                 return invalid; // less than 5 years in US
             }
+        */
         }
         // now we are sure that
         // - author was a US person <= last_us_year
@@ -244,10 +251,10 @@ public:
         // find the destination country
         int country_id = __builtin_ctz(mask);   // here we assume the author is only in one country, if the author is in multiple countries, the most populus will be used
         int migration_year_off = off;
-        // Rule 6. If there's an overlap year, the overlap year is the migration year,
+        // Rule 6. If there's an overlap year, the overlap year + 1 is the migration year,
         // otherwise, the migration year is the first year the author is in a non-US country
         if (at(last_us_year) & (1 << country_id)) {
-            migration_year_off = last_us_year;
+            migration_year_off = last_us_year + 1;
         }
         return Migration(migration_year_off, country_id);
     }
