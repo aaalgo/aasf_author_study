@@ -99,8 +99,11 @@ class Analyze:
             plt.pie(Y, labels=X, colors=colors)
             plt.savefig(f'{self.root}/pie_{domain["display_name"].replace(" ", "_")}_{year}.png')
 
+ROOT = '20250108_outflow'
+#ROOT = 'from_NIH/outflow'
+ROOT = 'data/new/outflow'
         
-anal = Analyze('20250108_outflow', 2010, 2024)
+anal = Analyze(ROOT, 2010, 2024)
 anal.plot_chinese_to_china()
 anal.plot_chinese_vs_non_chinese()
 anal.plot_all_to_destinations(None, "All Different Destinations")

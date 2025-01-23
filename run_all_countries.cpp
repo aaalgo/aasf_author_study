@@ -52,6 +52,15 @@ int constexpr EnCS_DOMAIN_ID = -2;
 int constexpr FIELD_ENGINEERING = 22;
 int constexpr FIELD_CS = 17;
 
+enum SurveyType {
+    SURVEY_INFLOW,
+    SURVEY_OUTFLOW,
+    SURVEY_OUTFLOW_EXPERIENCED,
+    SURVEY_OUTFLOW_NOT_EXPERIENCED
+};
+
+int constexpr EXPERIENCED_THRESHOLD = 25;
+
 namespace errors {
     atomic<int> bad_json(0);
     atomic<int> invalid_id(0);
@@ -188,12 +197,29 @@ public:
         return false;
     }
 
+/*
     bool relevant () const {
         auto mig = get_migration();
         return mig.country_id > 0;
     }
+*/
 
-    Migration get_migration () const {
+    bool is_inflow () const {
+        auto mig = get_migration_inflow();
+        return mig.country_id > 0;
+    }
+
+    bool is_outflow () const {
+        auto mig = get_migration_outflow();
+        return mig.country_id > 0;
+    }
+
+    Migration get_migration (SurveyType type) const {
+        if (type == SURVEY_INFLOW) return get_migration_inflow();
+        return get_migration_outflow();
+    }
+
+    Migration get_migration_outflow () const {
         // get migration info of this author based on the year masks
         Migration invalid;
         if (has_gap()) return invalid;
@@ -258,6 +284,50 @@ public:
         }
         return Migration(migration_year_off, country_id);
     }
+
+    Migration get_migration_inflow () const {
+        // get migration info of this author based on the year masks
+        Migration invalid;
+        // Rule 1.  If no country history, the author is not relevant.
+        int off = 0;
+        while ((off < size()) && (at(off) == 0)) ++off;
+        if (off >= size()) return invalid;
+        // found the first year with non-zero mask
+        int first_year = off;
+        // Rule 2.  If the first year is in US, the author is not relevant.
+        if (at(first_year) & COUNTRY_MASK_US) return invalid;
+
+        off = size() - 1;
+        while (off >= 0 && (at(off) == 0)) --off;
+        if (off < 0) return invalid;
+        int last_year = off;
+        // Rule 3.  If the last year is not in US, the author is not relevant.
+        if ((at(last_year) & COUNTRY_MASK_US) == 0) return invalid;
+        // now we are sure last_year author was in US
+
+        int last_non_us_year = -1;
+        int last_other_country_year = -1;
+        // last_other_country_year <= last_non_us_year
+        for (;;) {
+            // we migth find a two US years sandwiching some empty years
+            // in such case, we assume the empty years are also in US
+            while ((off) >= 0 && (at(off) & COUNTRY_MASK_US)) --off;
+            if (off < 0) throw 0;
+            last_non_us_year = off;
+            while ((off >= 0) && (at(off) == 0)) --off;
+            if (off < 0) throw 0;
+            if (at(off) & COUNTRY_MASK_US) {
+                continue;   // before the gap the author was in US, so keep searching backwards
+            }
+            last_other_country_year = off;
+            break;
+        }
+        if (last_non_us_year < 0) throw 0;
+        if (last_other_country_year < 0) throw 0;
+        uint32_t mask = at(last_other_country_year);
+        int country_id = __builtin_ctz(mask);   // here we assume the author is only in one country, if the author is in multiple countries, the most populus will be used
+        return Migration(last_non_us_year + 1, country_id);
+    }
 };
 
 openalex_id_t extract_id (string const &url, string const &prefix) {
@@ -301,11 +371,26 @@ struct Author {
     static string const URL_PREFIX;
     openalex_id_t id;
     string display_name;
+    vector<string> alternative_names;
     unordered_map<openalex_id_t, string> domains;
     YearMask years;
+    int works_count;
     Author (json const &j) {
         id = extract_id(j["id"], URL_PREFIX);
         display_name = j["display_name"];
+        if (j.contains("display_name_alternatives")) {
+            for (const auto &jname : j["display_name_alternatives"]) {
+                string name = jname.get<string>();
+                string regular;
+                regular.reserve(name.size());
+                for (char c: name) {
+                    if (c == '"') continue;
+                    regular.push_back(c);
+                }
+                alternative_names.push_back(regular);
+            }
+        }
+        works_count = j["works_count"].get<int>();
         domains[INVALID_ID] = "All";
         if (j.contains("topics")) {
             bool has_en_cs = false;
@@ -392,22 +477,31 @@ void filter_relevant (string const &datadir) {
     cout << "Found " << files.size() << " files" << endl;
     int done = 0;
     int total_in = 0;
-    int total_out = 0;
-    fs::create_directory("data/filtered_all");
+    int total_inflow = 0;
+    int total_outflow = 0;
+    fs::create_directory("data/filtered_inflow");
+    fs::create_directory("data/filtered_outflow");
     #pragma omp parallel for
     for (size_t i = 0; i < files.size(); ++i) {
         bxz::ifstream iss(files[i]);
-        bxz::ofstream oss(format("data/filtered_all/{}.gz", i), bxz::z);
+        bxz::ofstream inflow(format("data/filtered_inflow/{}.gz", i), bxz::z);
+        bxz::ofstream outflow(format("data/filtered_outflow/{}.gz", i), bxz::z);
         string line;
         int count_in = 0;
-        int count_out = 0;
+        int count_inflow = 0;
+        int count_outflow = 0;
         while (getline(iss, line)) {
             try {
                 Author author(json::parse(line));
                 ++count_in;
-                if (!author.years.relevant()) continue;
-                ++count_out;
-                oss << line << endl;
+                if (author.years.is_inflow()) {
+                    ++count_inflow;
+                    inflow << line << endl;
+                }
+                if (author.years.is_outflow()) {
+                    ++count_outflow;
+                    outflow << line << endl;
+                }
             } catch (const json::exception& e) {
                 errors::bad_json += 1;
             }
@@ -415,13 +509,14 @@ void filter_relevant (string const &datadir) {
         #pragma omp critical
         {
             total_in += count_in;
-            total_out += count_out;
+            total_inflow += count_inflow;
+            total_outflow += count_outflow;
             ++done;
-            cout << format("Processed {}/{}: {} in {} out, ratio = {:.4f}",
-                done, files.size(), count_in, count_out, 1.0 * count_out / count_in) << endl;
+            cout << format("Processed {}/{}: {} => inflow {} / outflow {}, ratio = {:.4f} {:.4f}",
+                done, files.size(), count_in, count_inflow, count_outflow, 1.0 * count_inflow / count_in, 1.0 * count_outflow / count_in) << endl;
         }
     }
-    cout << format("Total: {} in {} out, ratio = {:.4f}", total_in, total_out, 1.0 * total_out / total_in) << endl;
+    cout << format("Total: {} => inflow {} / outflow {}, ratio = {:.4f} {:.4f}", total_in, total_inflow, total_outflow, 1.0 * total_inflow / total_in, 1.0 * total_outflow / total_in) << endl;
     cerr << format("Errors: {} bad JSON, {} invalid IDs", errors::bad_json.load(), errors::invalid_id.load()) << endl;
 }
 
@@ -453,9 +548,18 @@ struct DomainCount: public Domain {
 
 struct Survey {
     unordered_map<openalex_id_t, DomainCount> domains;
-public:
+    SurveyType type;
+
+    Survey (SurveyType type_ = SURVEY_INFLOW): type(type_) {}
+
     void add (Author const &author) {
-        Migration mig = author.years.get_migration();
+        if (type == SURVEY_OUTFLOW_EXPERIENCED) {
+            if (author.works_count < EXPERIENCED_THRESHOLD) return;
+        }
+        else if (type == SURVEY_OUTFLOW_NOT_EXPERIENCED) {
+            if (author.works_count >= EXPERIENCED_THRESHOLD) return;
+        }
+        Migration mig = author.years.get_migration(type);
         int year_offset = mig.year_offset;
         if (year_offset < 0) return;
         //if (mig.country_id == OTHER_COUNTRY_ID) return;
@@ -491,17 +595,17 @@ public:
     }
 };
 
-void count_migration (string const &datadir, string const &outdir) {
+void count_migration_inflow (string const &datadir, string const &outdir) {
     vector<string> files;
     scan_files(datadir, &files);
     cout << "Found " << files.size() << " files" << endl;
     int done = 0;
-    Survey survey;
+    Survey survey(SURVEY_INFLOW);
     #pragma omp parallel for
     for (size_t i = 0; i < files.size(); ++i) {
         bxz::ifstream iss(files[i]);
         string line;
-        Survey local;
+        Survey local(SURVEY_INFLOW);
         while (getline(iss, line)) {
             try {
                 Author author(json::parse(line));
@@ -518,7 +622,162 @@ void count_migration (string const &datadir, string const &outdir) {
         }
     }
     cerr << format("Errors: {} bad JSON, {} invalid IDs", errors::bad_json.load(), errors::invalid_id.load()) << endl;
-    survey.save(outdir);
+    survey.save(outdir + "/inflow");
+}
+
+struct Outflow {
+    int64_t author_id;
+    int year;
+    int is_chinese;
+    int is_experienced;
+};
+
+void count_migration_outflow (string const &datadir, string const &outdir,
+                              std::unordered_set<int64_t> const &filter) {
+    vector<string> files;
+    scan_files(datadir, &files);
+    cout << "Found " << files.size() << " files" << endl;
+    int done = 0;
+    Survey survey(SURVEY_OUTFLOW);
+    Survey survey_experienced(SURVEY_OUTFLOW_EXPERIENCED);
+    Survey survey_not_experienced(SURVEY_OUTFLOW_NOT_EXPERIENCED);
+    vector<Outflow> outflows;
+    #pragma omp parallel for
+    for (size_t i = 0; i < files.size(); ++i) {
+        bxz::ifstream iss(files[i]);
+        string line;
+        Survey local(SURVEY_OUTFLOW);
+        Survey local_experienced(SURVEY_OUTFLOW_EXPERIENCED);
+        Survey local_not_experienced(SURVEY_OUTFLOW_NOT_EXPERIENCED);
+        while (getline(iss, line)) {
+            try {
+                Author author(json::parse(line));
+                if (!filter.empty()) {
+                    if (filter.count(author.id) == 0) continue;
+                }
+                Migration mig = author.years.get_migration(SURVEY_OUTFLOW);
+                if (mig.year_offset >= 0) {
+                    #pragma omp critical
+                    {
+                        int is_chinese = Surnames::is_chinese(author.display_name) ? 1 : 0;
+                        int is_experienced = author.works_count >= EXPERIENCED_THRESHOLD ? 1 : 0;
+                        outflows.push_back({author.id, mig.year_offset + YEAR_BEGIN, is_chinese, is_experienced});
+                    }
+                }
+                local.add(author);
+                local_experienced.add(author);
+                local_not_experienced.add(author);
+            } catch (const json::exception& e) {
+                errors::bad_json += 1;
+            }
+        }
+        #pragma omp critical
+        {
+            survey.merge(local);
+            survey_experienced.merge(local_experienced);
+            survey_not_experienced.merge(local_not_experienced);
+            ++done;
+            cout << format("Processed {}/{}", done, files.size()) << endl;
+        }
+    }
+    cerr << format("Errors: {} bad JSON, {} invalid IDs", errors::bad_json.load(), errors::invalid_id.load()) << endl;
+    survey.save(outdir + "/outflow");
+    survey_experienced.save(outdir + "/outflow_experienced");
+    survey_not_experienced.save(outdir + "/outflow_not_experienced");
+    ofstream os(outdir + "/outflow.txt");
+    os << "author_id,year,is_chinese,is_experienced" << endl;
+    for (auto const &o: outflows) {
+        os << o.author_id << "," << o.year << "," << o.is_chinese << "," << o.is_experienced <<  endl;
+    }
+}
+
+struct Institution {
+    int64_t id;
+    string display_name;
+    unordered_map<int64_t, std::pair<string, vector<string>>> authors;
+};
+
+void list_institutions (string const &datadir, string const &outdir) {
+    vector<string> files;
+    scan_files(datadir, &files);
+    cout << "Found " << files.size() << " files" << endl;
+    unordered_map<int64_t, Institution> institutions;
+    for (size_t i = 0; i < files.size(); ++i) {
+        bxz::ifstream iss(files[i]);
+        string line;
+        while (getline(iss, line)) {
+            try {
+                auto j = json::parse(line);
+                int64_t author_id = extract_id(j["id"], "https://openalex.org/A");
+                string author_name = j["display_name"];
+                vector<string> alternative_names;
+                if (j.contains("display_name_alternatives")) {
+                    for (auto const &jname : j["display_name_alternatives"]) {
+                        string name = jname.get<string>();
+                        string regular;
+                        regular.reserve(name.size());
+                        while (!name.empty() && std::isspace(name.front())) name.erase(0, 1);
+                        while (!name.empty() && std::isspace(name.back())) name.pop_back();
+                        for (char c: name) {
+                            if (c == '"') continue;
+                            regular.push_back(c);
+                        }
+                        alternative_names.push_back(regular);
+                    }
+                }
+                if (j.contains("affiliations")) {
+                    for (auto const &affiliation : j["affiliations"]) {
+                        string country = affiliation["institution"]["country_code"];
+                        if (country != "US") continue;
+                        int64_t inst_id = extract_id(affiliation["institution"]["id"], "https://openalex.org/I");
+                        string display_name = affiliation["institution"]["display_name"];
+                        {
+                            // There's one single "Hematology\Oncology Clinic"
+                            // which is very annoying.
+                            auto off = display_name.find('\\');
+                            if (off != string::npos) {
+                                display_name[off] = ' ';
+                            }
+                        }
+                        auto &inst = institutions[inst_id];
+                        if (inst.display_name.empty()) {
+                            inst.id = inst_id;
+                            inst.display_name = display_name;
+                        }
+                        else {
+                            if (inst.display_name != display_name) {
+                                cout << "Institution name mismatch: " << inst.display_name << " vs " << display_name << endl;
+                            }
+                        }
+                        inst.authors[author_id] = std::make_pair(author_name, alternative_names);
+                    }
+                }
+            }
+            catch (const json::exception& e) {
+                cerr << "JSON parsing error: " << e.what() << endl;
+                errors::bad_json += 1;
+            }
+        }
+    }
+    fs::create_directories(outdir);
+    ofstream os(outdir + "/institutions.json");
+    json j = json::array();
+    for (auto const &[id, inst]: institutions) {
+        json inst_json;
+        inst_json["id"] = std::to_string(id);
+        inst_json["display_name"] = inst.display_name;
+        inst_json["authors"] = json::array();
+        
+        for (auto const &[author_id, name_and_alternatives]: inst.authors) {
+            json author;
+            author["id"] = std::to_string(author_id);
+            author["display_name"] = name_and_alternatives.first;
+            author["display_name_alternatives"] = name_and_alternatives.second;
+            inst_json["authors"].push_back(author);
+        }
+        j.push_back(inst_json);
+    }
+    os << j.dump(2) << endl;
 }
 
 int main (int argc, char **argv) {
@@ -536,12 +795,21 @@ int main (int argc, char **argv) {
     else if (strcmp(argv[1], "filter") == 0) {
         filter_relevant("data/authors");
     }
+    else if (strcmp(argv[1], "list_outflow") == 0) {
+        list_institutions("data/filtered_outflow", "data/list_outflow");
+    }
+    else if (strcmp(argv[1], "list_all") == 0) {
+        list_institutions("data/authors", "data/list_all");
+    }
     else if (strcmp(argv[1], "count") == 0) {
         if (argc < 3) {
             cerr << "Usage: " << argv[0] << " test <out_dir>" << endl;
         }
         else {
-            count_migration("data/filtered_all", argv[2]);
+            std::unordered_set<int64_t> filter;
+            count_migration_inflow("data/filtered_inflow", argv[2]);
+            count_migration_outflow("data/filtered_outflow", argv[2], filter);
+            /*
             ofstream os("data/missing_country_stats.txt");
             vector<std::pair<string, int>> sorted;
             for (auto const &p: missing_country_stats) {
@@ -552,6 +820,28 @@ int main (int argc, char **argv) {
             for (auto const &p: sorted) {
                 os << p.first << "\t" << p.second << endl;
             }
+            */
+        }
+    }
+    else if (strcmp(argv[1], "count_filtered") == 0) {
+        if (argc < 4) {
+            cerr << "Usage: " << argv[0] << " count_filtered <out_dir> <filter>" << endl;
+        }
+        else {
+            std::unordered_set<int64_t> filter;
+            string filter_file = argv[3];
+            ifstream is(filter_file);
+            string line;
+            // Skip header
+            getline(is, line);
+            while (getline(is, line)) {
+                size_t pos = line.find(',');
+                if (pos != string::npos) {
+                    int64_t id = stoll(line.substr(0, pos));
+                    filter.insert(id);
+                }
+            }
+            count_migration_outflow("data/filtered_outflow", argv[2], filter);
         }
     }
     return 0;

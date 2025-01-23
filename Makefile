@@ -2,4 +2,7 @@ CXXFLAGS += -O3 -g -I3rd/json/single_include -I3rd/bxzstr/include -I3rd/xtensor/
 LDFLAGS += -fopenmp
 LDLIBS += -lz
 
-all:	run_all_countries_outflow run_all_countries_inflow
+all:	run_all_countries match_emails
+
+
+match_emails:	match_emails.cpp match.cpp
